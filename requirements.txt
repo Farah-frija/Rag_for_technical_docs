@@ -1,0 +1,34 @@
+# --- Core / config / observability ---
+pydantic
+pydantic-settings
+python-dotenv
+
+# --- PDF -> Markdown ---
+pdfplumber
+pymupdf
+
+# --- LLM providers ---
+google-genai          # Gemini (default provider)
+requests              # Ollama HTTP client
+langgraph             # TOC-extraction state machine
+langgraph-checkpoint
+
+# --- Embeddings / reranking ---
+sentence-transformers
+transformers
+torch
+
+# --- Retrieval ---
+rank-bm25
+
+# --- Vector store (pluggable; default provider) ---
+chromadb
+
+# --- Indexing / eval data handling ---
+pandas
+
+# --- Viewer app ---
+streamlit
+
+# --- Dev / testing ---
+pytest
