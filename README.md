@@ -1,190 +1,256 @@
 # manual-rag
 
-A production-oriented Retrieval-Augmented-Generation stack for long technical
-manuals: **PDF -> Markdown -> hierarchical index -> pluggable retrieval -> answer**.
+A RAG (Retrieval-Augmented Generation) stack for **technical manuals in PDF format that contain a table of contents**. It answers questions in natural language and cites the page and section of each source passage.
 
-This is a from-scratch reorganisation of an earlier prototype into a
-maintainable, observable, pluggable architecture. Nothing about *what* the
-system does changed (same PDF conversion, same TOC-detection state machine,
-same three retrieval strategies) — what changed is *how the pieces are wired
-together*.
+This README documents the **contextual layout** configuration (`--chunk-with-layout-context`), the one used for the final results.
 
-## Why this layout
+---
 
-The prototype had three structural problems this rewrite fixes:
+## 1. What "contextual layout" means
 
-1. **Providers were hardcoded.** Gemini clients, `SentenceTransformer`
-   instances, and rate limiters were instantiated as module-level globals
-   inside `retriever.py`, `page_index_approach.py`, and `summarize_tree.py`
-   independently. Swapping the LLM or the embedding model meant editing
-   three files. Now every provider sits behind an interface in
-   `manual_rag/core/interfaces.py`, built by a `factory.py` in its own
-   package, selected by one config value.
-2. **Prompts lived inline.** Every f-string prompt was defined next to the
-   code that used it. Now every prompt lives in `manual_rag/prompts/`,
-   grouped by pipeline stage, and nowhere else.
-3. **No vector database.** The prototype cached embeddings inside the tree's
-   JSON and did brute-force cosine similarity in a Python loop. There was no
-   abstraction to swap in a real vector DB. `manual_rag/vectorstore/` adds
-   that abstraction (Chroma by default, or a zero-dependency in-memory
-   store), used by the flat/vanilla retriever and the indexing pipeline's
-   sync step.
+Instead of cutting the manual into fixed-size pieces, the document is cut **along its own structure**:
 
-## Architecture
+1. The table of contents (TOC) is extracted and turned into a tree (document → chapters → sections → blocks).
+2. Chunks are built **inside a section**: they never cross a section boundary.
+3. Blocks (text, tables, code) are kept whole when possible. A block larger than the window is split with a sliding window and an overlap. Images are not embedded.
+4. **Contextual part:** before embedding, the 2-level section path (the section title and its parent) is prepended to each chunk. Only the *embedded* text contains the path; the stored text stays the original chunk.
+
+| Flag | Variant | Vector collection |
+|---|---|---|
+| *(none)* | vanilla chunking | `vanilla` |
+| `--chunk-with-layout` | layout chunks, no path prefix | `layout` |
+| `--chunk-with-layout-context` | layout chunks + section path prefix | `layout_contextual` |
+
+If both layout flags are given, the contextual one wins.
+
+---
+
+## 2. Architecture
+
+### 2.1 Pipeline
+
+```mermaid
+flowchart LR
+  subgraph Indexing
+    A[PDF] --> B[Markdown conversion]
+    B --> C[TOC extraction<br/>heuristics + LLM, LangGraph]
+    C --> D[Document tree]
+    D --> E[Layout contextual chunking]
+    E --> F[Embedding]
+    F --> G[(Chroma<br/>layout_contextual)]
+    E --> H[(BM25 corpus)]
+  end
+  subgraph Query
+    Q[Question] --> QD[Query decomposition<br/>guided by the TOC]
+    QD --> DS[Dense search]
+    QD --> BS[BM25 search]
+    DS --> RRF[Rank fusion RRF]
+    BS --> RRF
+    RRF --> RR[Cross-encoder reranking]
+    RR --> GEN[LLM generation<br/>with citation tags]
+  end
+  G -.-> DS
+  H -.-> BS
+```
+
+### 2.2 Stages
+
+**Indexing**
+- **Markdown conversion:** the PDF is converted page by page; tables, images and text are reassembled in reading order, and each page keeps its number.
+- **TOC extraction:** only the first pages are candidates; they are scored with structure heuristics (title, page numbers, numbered entries, dot leaders). The best early page is probed by an LLM in a LangGraph loop that follows the TOC across pages until it ends.
+- **Tree construction:** one node per TOC entry, content attached as text/table/image leaves with page and section title.
+- **Chunking, embedding, storage:** layout contextual chunks are embedded with a Sentence Transformers model and stored in Chroma. The same chunks feed the BM25 index.
+
+**Retrieval** (for each sub-query)
+- **Query decomposition:** an LLM splits multi-hop questions into sub-queries, using the TOC to know which topics the manual covers. If no split is needed, the original question is used.
+- **Hybrid search:** dense (Chroma) + sparse (BM25), each returning its top candidates.
+- **Reciprocal Rank Fusion:** `RRF(c) = Σ 1 / (k + rank(c))`, with `k = 60`.
+- **Reranking:** a cross-encoder rescored the fused candidates; only the best chunks go to generation.
+
+**Generation**
+- Each retained chunk is tagged with its id, page and section title, so the LLM can cite it.
+- If no chunk is retained for a sub-query, no LLM call is made and the system says nothing relevant was found.
+- Sub-query answers are combined; the final **confidence is the lowest** among the sub-queries.
+
+### 2.3 Software design
+
+The code follows a **hexagonal (ports and adapters)** architecture: the RAG logic in `core/` depends only on interfaces, and each external capability has adapters created by a factory from the settings.
+
+| Port | Adapters |
+|---|---|
+| LLM client | Gemini (cloud API), Ollama (local models) |
+| Embedding provider | Sentence Transformers |
+| Vector store | Chroma |
+| Reranker | Cross-encoder |
 
 ```
 manual_rag/
-├── config.py            # Settings (pydantic-settings, env-driven) -- the
-│                         # ONLY place that reads os.environ for app config
-├── logging_config.py     # One place that configures logging (JSON logs,
-│                         # console, a dedicated llm_calls.log)
-├── core/
-│   ├── models.py          # TreeNode / ManualIndex / NodeType / KnowledgeGraph
-│   ├── interfaces.py      # LLMClient, EmbeddingProvider, VectorStore,
-│   │                       # Reranker, Retriever -- the pluggability contracts
-│   └── exceptions.py
-├── utils/                 # Shared, reusable, stateless logic
-│   ├── rate_limiter.py     # One RateLimiter, used by every LLM client
-│   ├── text.py             # tokenize / normalise_title / cosine_similarity
-│   ├── tracing.py          # timed() context manager + TraceRecorder
-│   └── json_io.py          # atomic save_tree/load_tree
-├── llm/                   # Pluggable LLM provider
-│   ├── base.py              # BaseLLMClient: rate limit + retry + logging
-│   ├── gemini_client.py
-│   ├── ollama_client.py
-│   └── factory.py            # get_llm_client(settings) -> LLMClient
-├── embeddings/            # Pluggable embedding provider
-│   ├── sentence_transformers_provider.py
-│   └── factory.py
-├── rerankers/             # Pluggable cross-encoder reranker
-│   ├── cross_encoder.py
-│   └── factory.py
-├── vectorstore/           # Pluggable vector database
-│   ├── chroma_store.py      # default: embedded, persistent
-│   ├── in_memory_store.py   # zero-dependency fallback / tests
-│   └── factory.py
-├── prompts/               # Every prompt string + JSON schema, nothing else
-│   ├── toc_extraction.py
-│   ├── section_analysis.py
-│   ├── retrieval.py
-│   └── vanilla_rag.py
-├── indexing/              # PDF -> ManualIndex pipeline
-│   ├── pdf_to_markdown.py   # tables / images / text-around-obstacles
-│   ├── toc_graph.py          # LangGraph page-probing state machine
-│   ├── toc_extractor.py      # page scoring/ranking + orchestration
-│   ├── tree_builder.py       # TOC-sectioned tree OR flat page-chunked corpus
-│   ├── summarizer.py         # bottom-up section summaries + entity embeddings
-│   ├── bm25.py
-│   └── pipeline.py           # IndexingPipeline -- orchestrates all of the
-│                              # above and fires on_complete() when done
-├── retrieval/              # Three interchangeable retrieval strategies
-│   ├── tree_retriever.py     # embed-prune -> LLM router -> CE rerank -> synth
-│   ├── vanilla_retriever.py  # dense (vector store) + BM25 -> RRF -> CE -> LLM
-│   ├── page_index_retriever.py  # pure LLM hierarchical traversal
-│   └── factory.py            # get_retriever(index, settings, strategy)
-├── eval/evaluator.py       # Stage-by-stage precision/recall/F1/hit-rate,
-│                            # works against ANY Retriever via stage_capture
-├── app/viewer.py           # Streamlit tree viewer (self-contained)
-└── cli.py                  # `manual-rag index|query|chat|evaluate|view`
-scripts/
-└── watch_and_index.py     # optional: fully-automatic folder-watch indexing
-tests/
-└── test_pluggability.py   # fakes-based tests, no network/model downloads
+  cli.py              entry point, builds the components
+  config.py           centralized settings
+  logging_config.py
+  core/               ports (interfaces) and models
+  embeddings/         embedding adapters + factory
+  llm/                LLM adapters + factory
+  rerankers/          reranker adapters + factory
+  vectorstore/        vector store adapters + factory
+  indexing/           parsing, TOC, tree, chunking, BM25
+  retrieval/          retrieval strategies + factory
+  prompts/            LLM prompts
+  eval/               evaluation harness
+  app/                Streamlit viewer
+  utils/              text, tracing, JSON helpers
 ```
 
-### The pluggability contracts (`core/interfaces.py`)
+> The report's project-structure figure calls the root package `advanced_rag/`; the code imports it as `manual_rag`. Use whichever name your repository actually has.
 
-| Interface         | What it abstracts                     | Built-in implementations                  |
-|--------------------|----------------------------------------|--------------------------------------------|
-| `LLMClient`         | structured-output chat completion      | Gemini, Ollama (local)                      |
-| `EmbeddingProvider`  | text -> vector                         | sentence-transformers                       |
-| `VectorStore`        | vector upsert/query                    | Chroma, in-memory                           |
-| `Reranker`           | (query, doc) -> relevance score        | HF cross-encoder, no-op                     |
-| `Retriever`          | query -> `RetrievalResult`             | tree, vanilla (dense+BM25), page_index      |
+---
 
-Every pipeline module (`indexing/*`, `retrieval/*`) depends **only** on these
-interfaces. Swapping a provider is: write one adapter class implementing the
-interface, add one branch to that package's `factory.py`, flip one env var.
-
-### Indexing ends with an explicit event, not a convention
-
-`IndexingPipeline.run(..., on_complete=hook)` calls `hook(index_path, index)`
-the moment the enriched index is built, embedded, saved, and synced to the
-vector store. The CLI wires this to auto-launch retrieval by default:
+## 3. Installation
 
 ```bash
-# builds the index AND immediately runs the configured smoke-test queries
-# against it (or drops into an interactive loop with --auto-retrieve-mode interactive)
-manual-rag index manual.pdf manual_index.json
-
-# skip auto-retrieve, run it yourself later
-manual-rag index manual.pdf manual_index.json --no-auto-retrieve
-manual-rag query manual_index.json "What is the torque spec for bolt X?"
-manual-rag chat manual_index.json                 # interactive loop
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -e .                   # or: pip install -r requirements.txt
 ```
 
-For a fully automatic pipeline (drop a PDF in a folder, get an indexed +
-smoke-tested manual with zero commands), see `scripts/watch_and_index.py`,
-which uses the exact same `on_complete` hook, just triggered by a filesystem
-poll instead of a CLI invocation.
+Choose the LLM in `manual_rag/config.py` (settings object `Settings`):
 
-## Quickstart
+- **Gemini (cloud API):** set your API key as the settings expect (see `config.py`).
+- **Ollama (local):** install Ollama, pull a model, and keep the Ollama server running. Use this for confidential documents.
+
+The embedding model and the cross-encoder are downloaded on first use.
+
+---
+
+## 4. How to run (contextual layout)
+
+All commands are `manual-rag <command>`. If the console script is not installed, use `python -m manual_rag.cli <command>`.
+
+**Golden rule:** pass the **same** `--chunk-with-layout-context` flag to `index`, `query`, `chat` and `evaluate`. The flag selects which vector collection and BM25 corpus are loaded; a mismatch silently queries the wrong index.
+
+### Step 1: build the index
 
 ```bash
-python -m venv .venv 
-venv\Scripts\activate   
-pip install -r requirements.txt
-cp .env.example .env        # fill in GEMINI_API_KEY, or set MANUAL_RAG_LLM_PROVIDER=ollama
-
-manual-rag index docs/my_manual.pdf data/my_manual.json --no-vector-sync
-manual-rag query data/my_manual.json "How do I reset the device?"
-manual-rag evaluate data/my_manual.json eval_questions.csv results/run1 --retriever tree
-streamlit run manual_rag/app/viewer.py    # upload data/my_manual.json in the sidebar
+manual-rag index manual.pdf manual_index.json \
+  --chunk-with-layout-context \
+  --retriever layout \
+  --no-auto-retrieve
 ```
 
-Switch providers with env vars, no code changes:
+This produces `manual_index.json` (the tree), fills the Chroma collection `layout_contextual`, and writes the BM25 corpus.
+
+### Step 2: ask questions
 
 ```bash
-export MANUAL_RAG_LLM_PROVIDER=ollama
-export MANUAL_RAG_LLM_OLLAMA_MODEL=llama3.1
-export MANUAL_RAG_VECTORSTORE_PROVIDER=in_memory   # no Chroma dependency needed
-manual-rag index docs/my_manual.pdf data/my_manual.json
+# one question
+manual-rag query manual_index.json "How do I configure the backup schedule?" \
+  --chunk-with-layout-context --retriever layout
+
+# interactive session (type exit, quit, or Ctrl-D to leave)
+manual-rag chat manual_index.json --chunk-with-layout-context --retriever layout
 ```
 
-## Observability
-
-Everything logs through `manual_rag/logging_config.py` into `./logs/`:
-
-- `logs/app.log` — every module's structured (JSON by default) log output.
-- `logs/llm_calls.log` — every LLM prompt, output, token usage, and error,
-  regardless of provider (this is what `BaseLLMClient` guarantees).
-
-Every retrieval call also returns a `RetrievalResult.trace_entries` list (one
-entry per LLM call made while answering that query) and a `stage_capture`
-dict (which node/chunk ids survived each pipeline stage) — this is what
-`manual_rag/eval/evaluator.py` reads to compute precision/recall per stage,
-and what a future UI could render as a "why did it answer this way" trace.
-
-## Testing
+### Step 3: evaluate
 
 ```bash
-pip install -e ".[dev]"
-pytest tests/ -v
+manual-rag evaluate manual_index.json questions.csv results/run1 \
+  --chunk-with-layout-context --retriever layout
 ```
 
-`tests/test_pluggability.py` proves the interfaces are genuinely
-implementable/substitutable using in-memory fakes — no API keys, no model
-downloads, no network access required to run it.
+### Step 4: browse the index (optional)
 
-## Extending
+```bash
+manual-rag view manual_index.json
+```
 
-- **New LLM provider**: implement `LLMClient` (or subclass `llm/base.BaseLLMClient`)
-  in `manual_rag/llm/`, add a branch in `llm/factory.py`, add settings fields
-  to `config.LLMSettings`.
-- **New vector database**: implement `VectorStore` in `manual_rag/vectorstore/`,
-  add a branch in `vectorstore/factory.py`.
-- **New retrieval strategy**: implement `Retriever` in `manual_rag/retrieval/`,
-  add a branch in `retrieval/factory.py`, add one entry to
-  `eval/evaluator.STAGE_KEY_MAP` if you want it evaluable.
-- **Shared logic**: if you find yourself copy-pasting a helper across two
-  pipeline modules, it belongs in `manual_rag/utils/`, not in either module.
+This only prints how to start the Streamlit viewer, then upload the JSON in the sidebar.
+
+---
+
+## 5. CLI reference
+
+### Shared options
+
+| Option | Meaning |
+|---|---|
+| `--chunk-with-layout-context` | Select the contextual layout variant (collection `layout_contextual`). **Required on every command** for this configuration. |
+| `--retriever NAME` | Retrieval strategy (choices come from `STRATEGIES` in `retrieval/factory.py`). Default `tree`. |
+| `--no-split-subqueries` | Disable query decomposition: the question is used as a single query. Supported by the `tree` and `layout` strategies. |
+
+> **Important, `--retriever`:** the default `tree` strategy does **not** load the vector store or the BM25 corpus, so it does not use your contextual chunks. For this configuration pass the strategy that runs hybrid retrieval over the chunks (`layout`, to be confirmed against `STRATEGIES`).
+
+### `index`: build and save an index
+
+```
+manual-rag index <pdf> <output> [options]
+```
+
+| Argument / option | Meaning |
+|---|---|
+| `pdf` | Path of the manual (PDF with a table of contents). |
+| `output` | Where to save the tree index (JSON). |
+| `--mode {auto,toc,no_toc}` | How the structure is obtained. `auto` (default) decides by itself. |
+| `--skip-llm-summarization` | Skip the LLM summaries of sections (faster, cheaper). |
+| `--auto-retrieve-mode {smoke_test,interactive}` | What to do right after indexing: run the smoke-test queries from the settings (default) or open an interactive session. |
+| `--no-auto-retrieve` | Do nothing after indexing. |
+
+What it does: selects the collection, sets the chunk size to `min(configured size, embedder max tokens)`, sets the overlap to `size × overlap ratio` if not fixed, then runs the indexing pipeline (conversion, TOC, tree, chunking, embedding, Chroma, BM25).
+
+### `query`: one question
+
+```
+manual-rag query <index_path> "<question>" [options]
+```
+
+Loads the index, builds the retriever once, runs the question, and prints the answer with its **confidence**.
+
+### `chat`: interactive session
+
+```
+manual-rag chat <index_path> [options]
+```
+
+Same as `query`, but the retriever is built once and reused for many questions. Empty input, `exit`, `quit` or Ctrl-D ends the session; an error on one question does not stop it.
+
+### `evaluate`: retrieval evaluation
+
+```
+manual-rag evaluate <index_path> <csv_path> <output_prefix> [options]
+```
+
+| Argument / option | Meaning |
+|---|---|
+| `csv_path` | Evaluation questions with their reference sections and pages. |
+| `output_prefix` | Prefix of the result files. |
+| `--limit N` | Evaluate only N questions. |
+| `--start-at N` | Start at question N (to continue a run). |
+| `--resume` | Declared by the parser but **not currently passed to the evaluator**, so it has no effect; use `--start-at` instead. |
+
+Metrics reported: precision, recall, F1, hit rate, context precision and MRR. Chunks are matched to the reference by **section name**, not by id, so scores are approximate.
+
+### `view`: Streamlit viewer
+
+```
+manual-rag view <index_path>
+```
+
+Prints the instructions to launch the viewer; it does not start it. Start the app with Streamlit directly (`streamlit run <path-to-app/viewer.py>`; the printed `streamlit run -m ...` form is not valid Streamlit syntax).
+
+---
+
+## 6. Things to know
+
+- **The collection name is fixed.** In contextual mode it is always `layout_contextual`; it does not depend on the PDF name. Indexing a second manual puts its chunks in the same collection. Use a separate working directory, or clear the collection, between manuals.
+- **Same flag everywhere** (section 4), otherwise another collection is read.
+- **Privacy:** with the Gemini adapter, text is sent to a cloud API. For confidential documents use the Ollama adapter.
+- **Scope:** PDF manuals with a table of contents. Images are kept in the tree but are not embedded.
+
+## 7. Reference settings used for the reported results
+
+| Parameter | Value |
+|---|---|
+| Max chunk size | 384 tokens |
+| Overlap | 10% (38 tokens) |
+| Candidates per retriever (dense / BM25) | 50 / 50 |
+| Candidates kept after fusion, passed to the reranker | 20 |
+| RRF constant `k` | 60 |
