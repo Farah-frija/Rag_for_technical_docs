@@ -3,6 +3,18 @@
 A RAG (Retrieval-Augmented Generation) stack for **technical manuals in PDF format that contain a table of contents**. It answers questions in natural language and cites the page and section of each source passage.
 
 This README documents the **contextual layout** configuration (`--chunk-with-layout-context`), the one used for the final results.
+> **Note:** several hyperparameters were tuned to obtain these results,
+> including the number of candidates per retriever and after fusion (top-k),
+> the chunk size, and the overlap ratio. The final values are listed in
+> [Reference settings](#7-reference-settings-used-for-the-reported-results).
+>
+> **Evaluated against:** a set of 85 questions about the functional content
+> of the manual (29 single-hop, 29 multi-hop, 27 global), generated with
+> [PageIndex](https://github.com/VectifyAI/PageIndex). Each question comes
+> with its reference section and page.
+>  Metrics: precision, recall, F1, hit rate, context, precision and MRR.
+> **Caveat:** chunks are matched to the reference by section name, not by
+> id, so the scores are approximate.
 
 ---
 
