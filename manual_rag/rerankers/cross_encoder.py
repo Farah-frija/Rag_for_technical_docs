@@ -49,7 +49,9 @@ class CrossEncoderReranker(Reranker):
             )
             logit = model(**inputs).logits[0, 0]
             return float(torch.sigmoid(logit))
-
+    
+    
+#====================================================================
     def count_tokens(self, text: str) -> int:
         tokenizer, _ = self._ensure_loaded()
         return len(tokenizer.encode(text, add_special_tokens=False))

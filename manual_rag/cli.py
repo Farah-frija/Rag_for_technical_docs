@@ -61,35 +61,21 @@ def _configure_chunk_sizes(settings: Settings) -> None:
     logger.info(f"Chunk size: {cfg.chunk_token_size} tokens, overlap: {cfg.chunk_overlap_tokens} (embedder dim={dim})")
 
 def _make_retriever(index: ManualIndex, settings: Settings, strategy: str) -> Retriever:
-    """Build only the components the enabled steps need, then hand them to the factory.
+    """Build the components once, then hand them to the factory.
     Must run after _configure_stores: the collection name decides which
     vector store and BM25 corpus are loaded."""
-    r = settings.retrieval
+    llm = get_llm_client(settings.llm)
     embedder = get_embedding_provider(settings.embedding)
+    reranker = get_reranker(settings.reranker)
 
     if strategy == "tree":
-        deps = RetrieverDeps(
-            get_llm_client(settings.llm), embedder, get_reranker(settings.reranker),
-        )
-        return get_retriever(index, settings, deps, strategy=strategy)
-
-    if strategy == "layout":
-        need_llm = r.use_subquery_split or r.use_llm_responder
-        llm = get_llm_client(settings.llm) if need_llm else None
-        emb = embedder if r.use_dense else None
-        reranker = get_reranker(settings.reranker) if r.use_reranker else None
-        vector_store = get_vector_store(settings.vectorstore) if r.use_dense else None
+        deps = RetrieverDeps(llm, embedder, reranker)
+    else:
+        vector_store = get_vector_store(settings.vectorstore)
         corpus = load_bm25_corpus(bm25_corpus_path(settings.vectorstore.collection_name))
-        bm25_index = BM25Index.build(corpus) if (r.use_bm25 and corpus) else None
-        deps = RetrieverDeps(llm, emb, reranker, vector_store, corpus, bm25_index)
-        return get_retriever(index, settings, deps, strategy=strategy)
+        bm25_index = BM25Index.build(corpus) if corpus else None
+        deps = RetrieverDeps(llm, embedder, reranker, vector_store, corpus, bm25_index)
 
-    # vanilla
-    deps = RetrieverDeps(
-        get_llm_client(settings.llm), embedder, get_reranker(settings.reranker),
-        get_vector_store(settings.vectorstore),
-        load_bm25_corpus(bm25_corpus_path(settings.vectorstore.collection_name)),
-    )
     return get_retriever(index, settings, deps, strategy=strategy)
 
 
@@ -101,9 +87,6 @@ def _run_query(
 ) -> None:
     """Run one query on an already-built retriever."""
     if strategy in _SUPPORTS_SPLIT_SUBQUERIES:
-        # layout: False forces split off, True defers to settings.retrieval.use_subquery_split
-        if strategy == "layout" and split_subqueries:
-            split_subqueries = None
         result = retriever.retrieve(query, split_subqueries=split_subqueries)
     else:
         result = retriever.retrieve(query)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from manual_rag.config import RetrievalSettings
@@ -116,47 +118,84 @@ class LayoutRetriever(Retriever):
         self,
         subquery: str,
         trace: TraceRecorder,
+        timings: Dict[str, float],
     ) -> Tuple[SubQueryResult, List[str], List[str], List[str], List[str], List[str]]:
         """Returns (result, fused_ids, ce_ids, cited_ids_raw, dense_ranked, bm25_ranked).
-        `cited_ids_raw` is exactly what the LLM returned in `cited_chunks`
-        (empty when the responder is disabled)."""
+
+        `timings` is mutated: per-step seconds are accumulated (summed over sub-queries).
+        """
         s = self.settings
 
-        # 1) recall: fixed depth per retriever
         dense_ranked: List[str] = []
-        if s.use_dense:
-            with timed(f"query_embedding[{subquery[:30]}]", logger):
-                query_vec = self.embedder.embed_one(subquery)
-            with timed(f"dense_recall[{subquery[:30]}]", logger):
-                dense_matches = self.vector_store.query(query_vec, top_k=s.top_n_dense)
-                dense_ranked = [m.id for m in dense_matches]
-
         bm25_ranked: List[str] = []
-        if s.use_bm25 and self.bm25_index is not None:
+
+        # 1) Parallelize dense and BM25 recall
+        def run_dense() -> List[str]:
+            if not s.use_dense:
+                return []
+            with timed(f"query_embedding[{subquery[:30]}]", logger):
+                t0 = time.perf_counter()
+                query_vec = self.embedder.embed_one(subquery)
+                _acc(timings, "query_embedding", t0)
+            with timed(f"dense_recall[{subquery[:30]}]", logger):
+                t0 = time.perf_counter()
+                dense_matches = self.vector_store.query(query_vec, top_k=s.top_n_dense)
+                ids = [m.id for m in dense_matches]
+                _acc(timings, "dense_recall", t0)
+                return ids
+
+        def run_bm25() -> List[str]:
+            if not s.use_bm25 or self.bm25_index is None:
+                return []
             with timed(f"bm25_recall[{subquery[:30]}]", logger):
+                t0 = time.perf_counter()
                 bm25_scores = self.bm25_index.score(subquery)
-                bm25_ranked = [
+                ids = [
                     cid for cid, _ in sorted(bm25_scores.items(), key=lambda kv: kv[1], reverse=True)
                 ][: s.top_n_bm25]
+                _acc(timings, "bm25_recall", t0)
+                return ids
 
-        # 2) union of both lists (RRF only orders it; NO cut here)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_dense = executor.submit(run_dense)
+            future_bm25 = executor.submit(run_bm25)
+            dense_ranked = future_dense.result()
+            bm25_ranked = future_bm25.result()
+
+        # 2) RRF Fusion
+        t0 = time.perf_counter()
         fused_raw = _rrf_fuse(dense_ranked, bm25_ranked, k=s.rrf_k)
         fused_ids = [cid for cid, _ in fused_raw]
         fused_score_map = {cid: score for cid, score in fused_raw}
+        _acc(timings, "rrf_fusion", t0)
 
-        # 3) rerank the whole union, then cap to top_n_fusion
+        # 3) Batch Rerank or Fallback
         top_chunks: List[Dict[str, Any]] = []
         if self.use_rerank:
-            with timed(f"ce_rerank[{subquery[:30]}]", logger):
-                ce_scored: List[Dict[str, Any]] = []
+            t_rr = time.perf_counter()
+            with timed(f"ce_rerank_batch[{subquery[:30]}]", logger):
+                valid_chunks = []
+                texts_to_score = []
                 for cid in fused_ids:
                     chunk = self.id_to_chunk.get(cid)
-                    if not chunk:
-                        continue
-                    score = self.reranker.score(subquery, chunk["content"])
-                    ce_scored.append({**chunk, "ce_score": score})
-                ce_scored.sort(key=lambda x: x["ce_score"], reverse=True)
-            top_chunks = ce_scored[: s.top_n_fusion]
+                    if chunk:
+                        valid_chunks.append(chunk)
+                        texts_to_score.append(chunk["content"])
+
+                if valid_chunks:
+                    # Check if reranker supports batch scoring, otherwise fallback to loop
+                    if hasattr(self.reranker, "score_many"):
+                        scores = self.reranker.score_many(subquery, texts_to_score)
+                    else:
+                        scores = [self.reranker.score(subquery, text) for text in texts_to_score]
+
+                    ce_scored = [
+                        {**chunk, "ce_score": score}
+                        for chunk, score in zip(valid_chunks, scores)
+                    ]
+                    ce_scored.sort(key=lambda x: x["ce_score"], reverse=True)
+                    top_chunks = ce_scored[: s.top_n_fusion]
+            _acc(timings, "rerank", t_rr)
         else:
             for cid in fused_ids:
                 chunk = self.id_to_chunk.get(cid)
@@ -165,8 +204,9 @@ class LayoutRetriever(Retriever):
                 top_chunks.append({**chunk, "ce_score": fused_score_map.get(cid, 0.0)})
                 if len(top_chunks) >= s.top_n_fusion:
                     break
-        ce_ids = [c["id"] for c in top_chunks]             # stage 3 (measured)
-        llm_chunks = top_chunks[: s.top_n_for_context]     # what the LLM sees
+
+        ce_ids = [c["id"] for c in top_chunks]
+        llm_chunks = top_chunks[: s.top_n_for_context]
 
         if not top_chunks:
             return (
@@ -190,7 +230,7 @@ class LayoutRetriever(Retriever):
             for c in top_chunks
         ]
 
-        # 4) LLM answer (optional) -- off: stop here with the retrieved chunks
+        # 4) LLM answer (optional)
         if not s.use_llm_responder:
             return (
                 SubQueryResult(
@@ -216,10 +256,12 @@ class LayoutRetriever(Retriever):
             context="\n\n---\n\n".join(context_blocks),
         )
         with timed(f"responder_llm[{subquery[:30]}]", logger):
+            t0 = time.perf_counter()
             result = self.llm.generate_structured(
                 prompt, RESPONDER_SCHEMA,
                 label="LAYOUT_RESPONDER", trace=trace,
             )
+            _acc(timings, "responder_llm", t0)
         cited_raw = result.get("cited_chunks") or []
 
         return (
@@ -243,10 +285,9 @@ class LayoutRetriever(Retriever):
         query: str,
         split_subqueries: Optional[bool] = None,
     ) -> RetrievalResult:
-        """`split_subqueries=None` -> use settings.use_subquery_split.
-        A caller can still force it off with False, but cannot force it on
-        when the setting disabled it."""
         trace = TraceRecorder()
+        timings: Dict[str, float] = {}
+        t_total = time.perf_counter()
         s = self.settings
         logger.info(f"{len(self.corpus)} chunks in corpus")
 
@@ -254,6 +295,7 @@ class LayoutRetriever(Retriever):
         if no_index:
             trace.set_stage("stage2_per_subquery", [[]])
             trace.set_stage("stage3_per_subquery", [[]])
+            trace.set_stage("stage3b_per_subquery", [[]])
             trace.set_stage("stage4_per_subquery", [[]])
             trace.set_stage("num_subqueries", 1)
             trace.set_stage("subqueries_text", [query])
@@ -266,7 +308,9 @@ class LayoutRetriever(Retriever):
             s.use_subquery_split and split_subqueries
         )
         if do_split:
+            t0 = time.perf_counter()
             subquery_texts = self._split_query(query, self._build_toc_string(), trace)
+            _acc(timings, "subquery_split", t0)
         else:
             subquery_texts = [query]
 
@@ -282,7 +326,7 @@ class LayoutRetriever(Retriever):
         subquery_results: List[SubQueryResult] = []
 
         for sq in subquery_texts:
-            sq_result, fused_ids, ce_ids, cited_raw, d_ids, b_ids = self._run_subquery(sq, trace)
+            sq_result, fused_ids, ce_ids, cited_raw, d_ids, b_ids = self._run_subquery(sq, trace, timings)
             stage1_dense.append(d_ids)
             stage1_bm25.append(b_ids)
             subquery_results.append(sq_result)
@@ -294,10 +338,14 @@ class LayoutRetriever(Retriever):
         trace.set_stage("stage1_bm25_per_subquery", stage1_bm25)
         trace.set_stage("stage2_per_subquery", stage2)
         trace.set_stage("stage3_per_subquery", stage3)
+        # NEW: what the LLM actually saw (top_n_for_context chunks after rerank)
+        trace.set_stage("stage3b_per_subquery", [ids[: s.top_n_for_context] for ids in stage3])
         trace.set_stage("stage4_per_subquery", stage4)
 
+        timings["retrieve_total"] = time.perf_counter() - t_total
+        trace.set_stage("timings_sec", {k: round(v, 4) for k, v in timings.items()})
+
         if not s.use_llm_responder:
-            # Retrieval-only: show the chunks instead of a generated answer.
             all_items = [it for r in subquery_results for it in r.items]
             return RetrievalResult(
                 query=query,
@@ -332,3 +380,8 @@ def _rrf_fuse(*ranked_lists: List[str], k: int = 60) -> List[Tuple[str, float]]:
         for rank, doc_id in enumerate(ranked):
             fused[doc_id] = fused.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
     return sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def _acc(timings: Dict[str, float], key: str, t0: float) -> None:
+    """Accumulate elapsed seconds since t0 into timings[key]."""
+    timings[key] = timings.get(key, 0.0) + (time.perf_counter() - t0)

@@ -10,6 +10,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import numpy as np
 import pandas as pd
 
 from manual_rag.config import Settings
@@ -46,6 +47,7 @@ STAGE_KEY_MAP: Dict[str, List[Tuple[str, str, str]]] = {
         ("stage1_bm25_per_subquery", "post_bm25", "per_subquery"),
         ("stage2_per_subquery", "post_fusion", "per_subquery"),
         ("stage3_per_subquery", "post_cross_encoder", "per_subquery"),
+        ("stage3b_per_subquery", "post_context_cut", "per_subquery"),  # NEW
         ("stage4_per_subquery", "post_llm_citation", "per_subquery_cited"),
     ],
 }
@@ -73,6 +75,57 @@ def get_stages(retriever_name: str, settings: Settings) -> List[Tuple[str, str, 
     if not r.use_llm_responder:
         skip.add("post_llm_citation")
     return [st for st in stages if st[1] not in skip]
+
+
+def get_stage_k(retriever_name: str, settings: Settings) -> Dict[str, str]:
+    """Configured k per stage, shown in the summary."""
+    if retriever_name != "layout":
+        return {}
+    r = settings.retrieval
+    fusion_cap = (r.top_n_dense if r.use_dense else 0) + (r.top_n_bm25 if r.use_bm25 else 0)
+    return {
+        "post_dense": str(r.top_n_dense),
+        "post_bm25": str(r.top_n_bm25),
+        "post_fusion": f"<={fusion_cap}",
+        "post_cross_encoder": str(r.top_n_fusion),
+        "post_context_cut": str(r.top_n_for_context),
+        "post_llm_citation": f"<={r.top_n_for_context}",
+    }
+
+
+def get_timing_steps(retriever_name: str, settings: Settings) -> List[str]:
+    """Timing steps recorded by the retriever (layout only), in pipeline order."""
+    if retriever_name != "layout":
+        return []
+    r = settings.retrieval
+    steps: List[str] = []
+    if r.use_subquery_split:
+        steps.append("subquery_split")
+    if r.use_dense:
+        steps += ["query_embedding", "dense_recall"]
+    if r.use_bm25:
+        steps.append("bm25_recall")
+    steps.append("rrf_fusion")
+    if r.use_reranker:
+        steps.append("rerank")
+    if r.use_llm_responder:
+        steps.append("responder_llm")
+    steps.append("retrieve_total")
+    return steps
+
+
+def _answer_cosine(embedder: Any, expected: str, final: str) -> float:
+    """Cosine similarity between embeddings of the expected and final answers."""
+    if embedder is None or not expected or not final:
+        return float("nan")
+    try:
+        a = np.asarray(embedder.embed_one(expected), dtype=float)
+        b = np.asarray(embedder.embed_one(final), dtype=float)
+        denom = np.linalg.norm(a) * np.linalg.norm(b)
+        return float(a @ b / denom) if denom else float("nan")
+    except Exception as exc:
+        logger.warning(f"answer cosine failed: {exc}")
+        return float("nan")
 
 
 def _normalise(name: Optional[str]) -> str:
@@ -267,6 +320,7 @@ def evaluate_query(
     split_subqueries: bool = True,
     id_to_chunk: Optional[Dict[str, Dict[str, Any]]] = None,
     retriever: Optional[Retriever] = None,
+    embedder: Optional[Any] = None,
 ) -> Dict[str, Any]:
     query_id = row.get("id", "")
     category = str(row.get("category", "")).strip()
@@ -350,6 +404,17 @@ def evaluate_query(
     result["multi_hop_not_split"] = category.lower() == "multi-hop" and len(retrieval.subquery_results) <= 1
     result["tokens_total"] = sum((e.get("tokens") or {}).get("total_tokens") or 0 for e in retrieval.trace_entries)
 
+    # Timings recorded by the retriever (layout only), summed over sub-queries
+    timings = retrieval.stage_capture.get("timings_sec", {}) or {}
+    for step, v in timings.items():
+        result[f"time_{step}"] = v
+
+    # cosine(expected_answer, final_answer); meaningless if the answer is just raw chunks
+    answer_is_llm = not (retriever_name == "layout" and not settings.retrieval.use_llm_responder)
+    result["answer_cosine"] = (
+        _answer_cosine(embedder, expected_answer, final_answer) if answer_is_llm else float("nan")
+    )
+
     return result
 
 
@@ -412,8 +477,10 @@ def _build_csv_fields(retriever_name: str, settings: Settings) -> List[str]:
     fields += [
         "num_subqueries", "subqueries_text", "multi_hop_not_split",
         "final_answer", "final_confidence", "predicted_unknown", "tokens_total",
-        "elapsed_sec", "error", "traceback",
+        "answer_cosine",
     ]
+    fields += [f"time_{s}" for s in get_timing_steps(retriever_name, settings)]
+    fields += ["elapsed_sec", "error", "traceback"]
     return fields
 
 
@@ -422,7 +489,13 @@ def _nanmean(values: List[float]) -> Optional[float]:
     return sum(clean) / len(clean) if clean else None
 
 
-def aggregate(rows: List[Dict[str, Any]], stages: List[Tuple[str, str, str]]) -> Dict[str, Any]:
+def aggregate(
+    rows: List[Dict[str, Any]],
+    stages: List[Tuple[str, str, str]],
+    timing_steps: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    timing_steps = timing_steps or []
+
     def stage_block(subset: List[Dict[str, Any]]) -> Dict[str, Any]:
         block = {}
         for _, label, _shape in stages:
@@ -433,20 +506,34 @@ def aggregate(rows: List[Dict[str, Any]], stages: List[Tuple[str, str, str]]) ->
                 "hit_rate": _nanmean([r.get(f"{label}_hit") for r in subset]),
                 "context_precision": _nanmean([r.get(f"{label}_context_precision_mean") for r in subset]),
                 "mrr": _nanmean([r.get(f"{label}_mrr") for r in subset]),
+                "avg_n_pred": _nanmean([r.get(f"{label}_n_pred") for r in subset]),
                 "n_queries": len(subset),
             }
         return block
+
+    def extras_block(subset: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "answer_cosine": _nanmean([r.get("answer_cosine") for r in subset]),
+            "avg_elapsed_sec": _nanmean([r.get("elapsed_sec") for r in subset]),
+            "timing_by_step": {
+                s: _nanmean([r.get(f"time_{s}") for r in subset]) for s in timing_steps
+            },
+        }
 
     summary: Dict[str, Any] = {
         "n_total_queries": len(rows),
         "n_errored": sum(1 for r in rows if r.get("error")),
         "overall": stage_block(rows),
+        "overall_extras": extras_block(rows),
         "by_category": {},
+        "by_category_extras": {},
         "unknown_predictions": {"n_predicted_unknown": sum(1 for r in rows if r.get("predicted_unknown"))},
         "avg_tokens_per_query": _nanmean([r.get("tokens_total") for r in rows]),
     }
     for cat in sorted({r.get("category", "") for r in rows}):
-        summary["by_category"][cat] = stage_block([r for r in rows if r.get("category", "") == cat])
+        sub = [r for r in rows if r.get("category", "") == cat]
+        summary["by_category"][cat] = stage_block(sub)
+        summary["by_category_extras"][cat] = extras_block(sub)
     return summary
 
 
@@ -454,35 +541,47 @@ def _fmt(v: Optional[float]) -> str:
     return "  n/a " if v is None else f"{v:6.3f}"
 
 
-def print_summary(summary: Dict[str, Any], stages: List[Tuple[str, str, str]]) -> str:
-    lines = ["=" * 88, "RETRIEVAL EVALUATION SUMMARY", "=" * 88,
+def print_summary(
+    summary: Dict[str, Any],
+    stages: List[Tuple[str, str, str]],
+    stage_k: Optional[Dict[str, str]] = None,
+) -> str:
+    stage_k = stage_k or {}
+    lines = ["=" * 100, "RETRIEVAL EVALUATION SUMMARY", "=" * 100,
              f"Total queries : {summary['n_total_queries']}   Errored: {summary['n_errored']}", ""]
 
-    def block_table(title: str, block: Dict[str, Any]):
-        lines.append(f"-- {title} " + "-" * max(0, 70 - len(title)))
+    def block_table(title: str, block: Dict[str, Any], extras: Dict[str, Any]):
+        lines.append(f"-- {title} " + "-" * max(0, 80 - len(title)))
         lines.append(
-            f"{'stage':<24}{'precision':>10}{'recall':>10}{'f1':>10}{'hit_rate':>10}"
-            f"{'ctx_prec':>10}{'mrr':>10}{'n':>6}"
+            f"{'stage':<22}{'k':>8}{'precision':>10}{'recall':>10}{'f1':>10}{'hit_rate':>10}"
+            f"{'ctx_prec':>10}{'mrr':>10}{'avg_pred':>10}{'n':>6}"
         )
         for _, label, _shape in stages:
             s = block[label]
             lines.append(
-                f"{label:<24}{_fmt(s['precision']):>10}{_fmt(s['recall']):>10}"
+                f"{label:<22}{stage_k.get(label, '-'):>8}"
+                f"{_fmt(s['precision']):>10}{_fmt(s['recall']):>10}"
                 f"{_fmt(s['f1']):>10}{_fmt(s['hit_rate']):>10}{_fmt(s['context_precision']):>10}"
-                f"{_fmt(s['mrr']):>10}{s['n_queries']:>6}"
+                f"{_fmt(s['mrr']):>10}{_fmt(s['avg_n_pred']):>10}{s['n_queries']:>6}"
             )
+        lines.append(f"Answer cosine (expected vs final): {_fmt(extras['answer_cosine']).strip()}")
+        lines.append(f"Avg elapsed/query (s): {_fmt(extras['avg_elapsed_sec']).strip()}")
+        if extras["timing_by_step"]:
+            lines.append("Avg time by step (s/query, summed over sub-queries):")
+            for step, v in extras["timing_by_step"].items():
+                lines.append(f"  {step:<22}{_fmt(v)}")
         lines.append("")
 
-    block_table("OVERALL", summary["overall"])
+    block_table("OVERALL", summary["overall"], summary["overall_extras"])
     for cat, block in summary["by_category"].items():
-        block_table(f"CATEGORY: {cat}", block)
+        block_table(f"CATEGORY: {cat}", block, summary["by_category_extras"][cat])
 
     uk = summary["unknown_predictions"]
     lines.append("-- 'UNKNOWN' PREDICTIONS " + "-" * 50)
     lines.append(f"Queries where final answer/confidence = Unknown/not_found: "
                  f"{uk['n_predicted_unknown']} / {summary['n_total_queries']}")
     lines.append(f"Average tokens/query: {summary.get('avg_tokens_per_query')}")
-    lines.append("=" * 88)
+    lines.append("=" * 100)
 
     text = "\n".join(lines)
     print(text)
@@ -501,6 +600,8 @@ def run_evaluation(
     retriever: Optional[Retriever] = None,
 ) -> None:
     stages = get_stages(retriever_name, settings)
+    timing_steps = get_timing_steps(retriever_name, settings)
+    stage_k = get_stage_k(retriever_name, settings)
     fields = _build_csv_fields(retriever_name, settings)
     detailed_path = f"{output_prefix}_detailed.csv"
 
@@ -516,6 +617,11 @@ def run_evaluation(
     id_to_chunk: Optional[Dict[str, Dict[str, Any]]] = None
     if retriever_name in _CHUNK_BASED_RETRIEVERS:
         id_to_chunk = retriever.id_to_chunk
+
+    # Embedder used for cosine(expected_answer, final_answer)
+    embedder = getattr(retriever, "embedder", None)
+    if embedder is None:
+        logger.warning("No embedder on retriever; answer_cosine will be NaN.")
 
     df = pd.read_csv(csv_path)
     required = {"id", "category", "question", "expected_answer", "sections"}
@@ -539,6 +645,7 @@ def run_evaluation(
                 split_subqueries=split_subqueries,
                 id_to_chunk=id_to_chunk,
                 retriever=retriever,
+                embedder=embedder,
             )
             r["elapsed_sec"] = round(time.time() - t0, 2)
             writer.write_row(r)
@@ -549,9 +656,9 @@ def run_evaluation(
     # processed in this call, so a resumed run (start_at > 0) still
     # produces a summary covering every row written so far.
     rows_out = _load_detailed_csv(detailed_path)
-    summary = aggregate(rows_out, stages)
+    summary = aggregate(rows_out, stages, timing_steps)
     with open(f"{output_prefix}_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    summary_text = print_summary(summary, stages)
+    summary_text = print_summary(summary, stages, stage_k)
     with open(f"{output_prefix}_summary.txt", "w", encoding="utf-8") as f:
         f.write(summary_text + "\n")

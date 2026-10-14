@@ -88,8 +88,8 @@ class RetrievalSettings(BaseSettings):
     use_subquery_split: bool = False   # LLM splits the query into sub-queries; off -> 1 sub-query
     use_dense: bool = True            # dense vector recall
     use_bm25: bool = True             # BM25 recall (also gates loading the BM25 index)
-    use_reranker: bool = True      # cross-encoder rerank; off -> keep RRF order
-    use_llm_responder: bool = True  # LLM answer; off -> return retrieved chunks, no generation
+    use_reranker: bool = True     # cross-encoder rerank; off -> keep RRF order
+    use_llm_responder: bool = True # LLM answer; off -> return retrieved chunks, no generation
 
     # tree retriever
     embed_threshold: float = 0.15
@@ -118,8 +118,9 @@ class IndexingSettings(BaseSettings):
 
     image_output_dir: str = "./data/extracted_images"
     min_image_size_px: int = 500
-    chunk_word_size: int = 220
-    chunk_overlap_words: int = 40
+    chunk_token_size: Optional[int] = None
+    chunk_overlap_tokens: Optional[int] = None
+    chunk_overlap_ratio : float =0.1
     # chunk_token_size: Optional[int] = None        # None -> embedder dimension
     # chunk_overlap_tokens: Optional[int] = None    # None -> chunk_overlap_ratio * chunk size
     toc_candidate_page_cap: int = 10
