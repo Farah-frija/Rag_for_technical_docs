@@ -63,6 +63,7 @@ class RerankerSettings(BaseSettings):
     chunk_overlap_tokens: int = 64
     provider: Literal["cross_encoder", "none"] = "cross_encoder"
     model_name: str = "BAAI/bge-reranker-v2-m3"
+    device: Optional[str] = None  # None -> auto-detect (cuda if available, else cpu)
 
 
 # ── Vector store config ────────────────────────────────────────────────────

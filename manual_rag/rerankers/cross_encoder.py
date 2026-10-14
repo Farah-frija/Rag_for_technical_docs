@@ -15,6 +15,7 @@ from manual_rag.core.interfaces import Reranker
 from manual_rag.logging_config import get_logger
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
 logger = get_logger(__name__)
 
 
@@ -22,18 +23,23 @@ class CrossEncoderReranker(Reranker):
     def __init__(self, settings: RerankerSettings) -> None:
         self._model_name = settings.model_name
         self._chunk_overlap_tokens: int = settings.chunk_overlap_tokens
+        
+        # Auto-detect device if not explicitly provided in settings
+        self._device = settings.device
+        if self._device is None:
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            
         self._tokenizer = None
         self._model = None
+        self._torch = torch
 
     def _ensure_loaded(self):
         if self._model is None:
-            
-
-            logger.info(f"Loading cross-encoder reranker '{self._model_name}' ...")
+            logger.info(f"Loading cross-encoder reranker '{self._model_name}' on device '{self._device}'...")
             self._tokenizer = AutoTokenizer.from_pretrained(self._model_name)
             self._model = AutoModelForSequenceClassification.from_pretrained(self._model_name)
+            self._model.to(self._device)
             self._model.eval()
-            self._torch = torch
             logger.info("Cross-encoder reranker ready.")
         return self._tokenizer, self._model
 
@@ -47,11 +53,11 @@ class CrossEncoderReranker(Reranker):
                 truncation=True,
                 max_length=tokenizer.model_max_length,
             )
+            # Move inputs to the configured device (cuda/cpu)
+            inputs = {k: v.to(self._device) for k, v in inputs.items()}
             logit = model(**inputs).logits[0, 0]
             return float(torch.sigmoid(logit))
-    
-    
-#====================================================================
+
     def count_tokens(self, text: str) -> int:
         tokenizer, _ = self._ensure_loaded()
         return len(tokenizer.encode(text, add_special_tokens=False))
