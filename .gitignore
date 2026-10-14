@@ -6,7 +6,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-
+*.ipynb
 # Runtime data
 /data/
 /logs/
